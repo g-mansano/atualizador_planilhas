@@ -8,161 +8,110 @@ import io
 
 st.set_page_config(page_title="Atualizador de Carteira SAP", page_icon="⚙️", layout="wide")
 
-st.title("⚙️ Atualizador de Carteira SAP")
+st.title("⚙️ Atualizador de Carteira SAP (Nova Estrutura)")
 
 st.sidebar.header("Upload de Arquivos")
 mestre_file = st.sidebar.file_uploader("Upload da Planilha Mestre (.xlsx)", type=['xlsx'])
-dados_file = st.sidebar.file_uploader("Upload dos Dados Brutos SAP (.xlsx ou .csv)", type=['xlsx', 'csv'])
+dados_file = st.sidebar.file_uploader("Upload da Exportação SAP (3 abas)", type=['xlsx'])
 
-def processar_dados(df):
-    """
-    Realiza o tratamento de dados conforme as regras de negócio
-    """
-    df_tratado = df.copy()
+def processar_dados(dados_excel):
+    # 1. Ler as 3 abas específicas do SAP
+    df_prod = pd.read_excel(dados_excel, sheet_name='Em produção')
+    df_lib = pd.read_excel(dados_excel, sheet_name='Liberados')
+    df_sep = pd.read_excel(dados_excel, sheet_name='Em separação')
 
-    # 1. Fazer forward fill (ffill()) nas colunas de cabeçalho do SAP
+    # 2. Tratamento Inicial (ffill nos cabeçalhos)
     colunas_ffill = ['Nº doc.', 'Código do PN', 'Nome do PN']
-    colunas_presentes = [col for col in colunas_ffill if col in df_tratado.columns]
-    
-    if len(colunas_presentes) < len(colunas_ffill):
-        col_faltantes = set(colunas_ffill) - set(colunas_presentes)
-        st.warning(f"Aviso: Algumas colunas para ffill não foram encontradas: {', '.join(col_faltantes)}")
-    
-    if colunas_presentes:
-        df_tratado[colunas_presentes] = df_tratado[colunas_presentes].ffill()
+    for df in [df_prod, df_lib]:
+        col_presentes = [col for col in colunas_ffill if col in df.columns]
+        if col_presentes:
+            df[col_presentes] = df[col_presentes].ffill()
+        # Filtra linhas válidas
+        if 'Linha do documento' in df.columns:
+            df.dropna(subset=['Linha do documento'], inplace=True)
 
-    # 2. Filtrar apenas as linhas válidas (onde 'Linha do documento' não for nula)
-    if 'Linha do documento' in df_tratado.columns:
-        df_tratado = df_tratado[df_tratado['Linha do documento'].notna()]
-    else:
-        st.warning("Aviso: Coluna 'Linha do documento' não encontrada. O filtro não pôde ser aplicado.")
-
-    # 3. Classificar os status baseando-se na data atual gerando uma coluna ClassItem
-    # Como não sabemos a coluna exata de data no arquivo original, vamos usar 'Data de Vencimento' ou 'Data' como tentativa
+    # 3. Lógica Simplificada de Atrasados (Simulação da Aba 5)
     hoje = datetime.today()
     
-    col_data_encontrada = None
-    for col in ['Data de Vencimento', 'Data de Entrega', 'Data', 'Vencimento']:
-        if col in df_tratado.columns:
-            col_data_encontrada = col
-            break
+    df_atrasados_lista = []
+    for nome_origem, df_temp in [('Em Produção', df_prod), ('Liberados', df_lib)]:
+        if 'Data de Entrega' in df_temp.columns:
+            df_temp['Data de Entrega'] = pd.to_datetime(df_temp['Data de Entrega'], errors='coerce')
+            atrasados = df_temp[df_temp['Data de Entrega'].dt.date < hoje.date()].copy()
+            atrasados['Origem'] = nome_origem
+            df_atrasados_lista.append(atrasados)
             
-    if col_data_encontrada:
-        df_tratado[col_data_encontrada] = pd.to_datetime(df_tratado[col_data_encontrada], errors='coerce')
-        
-        def classificar_data(data):
-            if pd.isna(data):
-                return 'PENDENTE'
-            elif data.date() < hoje.date():
-                return 'ATRASADO'
-            else:
-                return 'ATENDIDO'
-                
-        df_tratado['ClassItem'] = df_tratado[col_data_encontrada].apply(classificar_data)
+    if df_atrasados_lista:
+        df_atrasados = pd.concat(df_atrasados_lista, ignore_index=True)
     else:
-        # Lógica genérica caso não haja coluna de data identificável
-        st.info("Nota: Nenhuma coluna de data padrão (ex: 'Data de Vencimento') identificada para classificação. Marcando todos como 'PENDENTE'.")
-        df_tratado['ClassItem'] = 'PENDENTE'
+        df_atrasados = pd.DataFrame()
 
-    # 4. Separar os DataFrames em abas lógicas (ex: df_producao, df_separacao, df_atrasados)
-    # A lógica exata dependerá das suas necessidades. Aqui dividimos usando o ClassItem como um exemplo.
-    df_producao = df_tratado[df_tratado['ClassItem'] == 'ATENDIDO']
-    df_separacao = df_tratado[df_tratado['ClassItem'] == 'PENDENTE']
-    df_atrasados = df_tratado[df_tratado['ClassItem'] == 'ATRASADO']
-
+    # 4. Dicionário com os Nomes EXATOS das abas da Planilha Mestre
     dict_dfs = {
-        'Producao': df_producao,
-        'Separacao': df_separacao,
-        'Atrasados': df_atrasados,
-        'Base Completa': df_tratado
+        '2-EM PRODUÇÃO': df_prod,
+        '3-LIBERADOS': df_lib,
+        '4-EM SEPARAÇÃO': df_sep,
+        '5-ATRASADOS': df_atrasados
     }
     
     return dict_dfs
 
 def injetar_dados_mestre(mestre_file, dict_dfs):
-    """
-    Lê a planilha mestre, limpa os dados antigos e injeta os novos dados célula a célula.
-    Preserva a formatação, cores, etc.
-    """
-    # Carregar o template (regra de ouro)
     wb = openpyxl.load_workbook(mestre_file)
     abas_atualizadas = []
     
     for nome_aba, df in dict_dfs.items():
-        # Apenas tenta atualizar se a aba existir na planilha mestre
         if nome_aba in wb.sheetnames:
             ws = wb[nome_aba]
-            
-            # Limpar os dados antigos (da linha 2 para baixo)
             max_row = ws.max_row
             max_col = ws.max_column
             
+            # Limpa os dados antigos (linha 2 para baixo)
             if max_row >= 2:
                 for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=max_col):
                     for cell in row:
                         cell.value = None
                         
-            # Injetar os novos dados
+            # Injeta os novos dados sem quebrar o layout
             if not df.empty:
-                # Converter DataFrame em linhas (ignorando header e index)
                 for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=False), 2):
                     for c_idx, value in enumerate(row, 1):
-                        # Tratamento para valores Nulos/Especiais do Pandas e Numpy (que quebram o openpyxl)
                         if pd.isna(value):
                             value = None
                         elif isinstance(value, np.integer):
                             value = int(value)
                         elif isinstance(value, np.floating):
                             value = float(value)
-                            
-                        # Acessar célula e atribuir valor (mantém a formatação original da célula)
                         ws.cell(row=r_idx, column=c_idx, value=value)
             
             abas_atualizadas.append(nome_aba)
             
     if not abas_atualizadas:
-        st.warning("Nenhuma das abas ('Producao', 'Separacao', 'Atrasados', 'Base Completa') foi encontrada na Planilha Mestre. O arquivo não foi modificado.")
+        st.warning(f"Nenhuma aba compatível foi encontrada na Planilha Mestre. Abas presentes no arquivo: {wb.sheetnames}")
             
-    # Salvar em buffer de memória para o Streamlit Download
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    
     return output
 
 if st.button("Processar e Atualizar Planilha", type="primary", use_container_width=True):
     if not mestre_file or not dados_file:
-        st.error("Por favor, faça o upload da Planilha Mestre e dos Dados SAP na barra lateral antes de processar.")
+        st.error("Por favor, faça o upload da Planilha Mestre e dos Dados SAP.")
     else:
         try:
-            with st.spinner("Lendo Dados Brutos SAP..."):
-                if dados_file.name.lower().endswith('.csv'):
-                    try:
-                        # Tenta ler com separador ponto e vírgula e encoding latin1 (comum no SAP no Brasil)
-                        df_bruto = pd.read_csv(dados_file, sep=';', encoding='latin1')
-                    except Exception:
-                        dados_file.seek(0)
-                        # Fallback para o padrão
-                        df_bruto = pd.read_csv(dados_file)
-                else:
-                    df_bruto = pd.read_excel(dados_file)
+            with st.spinner("Lendo Dados Brutos SAP (Nova Estrutura)..."):
+                dict_dfs = processar_dados(dados_file)
 
-            with st.spinner("Aplicando regras de negócio..."):
-                dict_dfs = processar_dados(df_bruto)
-
-            with st.spinner("Injetando dados na Planilha Mestre... (Isso pode demorar um pouco)"):
+            with st.spinner("Injetando dados e preservando formatação..."):
                 arquivo_processado = injetar_dados_mestre(mestre_file, dict_dfs)
                 
             st.success("Planilha processada e atualizada com sucesso! ✅")
-            
             st.download_button(
-                label="📥 Baixar Planilha_Atualizada.xlsx",
+                label="📥 Baixar Carteira_Atualizada.xlsx",
                 data=arquivo_processado,
-                file_name="Planilha_Atualizada.xlsx",
+                file_name="Carteira_Atualizada.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
-
         except Exception as e:
             st.error(f"Erro inesperado durante o processamento: {str(e)}")
-            st.exception(e)
